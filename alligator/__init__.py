@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from nltk.corpus import stopwords
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(override=True)
 
 TIMEOUT = aiohttp.ClientTimeout(
     total=30,  # Total time for the request

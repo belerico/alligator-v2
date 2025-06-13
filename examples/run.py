@@ -2,7 +2,6 @@ import os
 import time
 
 from alligator import PROJECT_ROOT, Alligator
-from alligator.log import enable_logging
 
 
 def main():
@@ -10,9 +9,8 @@ def main():
     num_ml_workers = 2
     worker_batch_size = 64
     mongo_uri = "mongodb://localhost:27017/"
-    input_csv = os.path.join(PROJECT_ROOT, "tables", "imdb_top_1000.csv")
+    input_csv = os.path.join(PROJECT_ROOT, "tables", "imdb_top_3.csv")
 
-    enable_logging()
     tic = time.perf_counter()
     gator = Alligator(
         input_csv=input_csv,
@@ -20,7 +18,6 @@ def main():
         num_ml_workers=num_ml_workers,
         worker_batch_size=worker_batch_size,
         mongo_uri=mongo_uri,
-        dataset_name="imdb",
     )
     gator.run()
     toc = time.perf_counter()

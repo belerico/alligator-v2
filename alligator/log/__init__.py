@@ -1,11 +1,12 @@
-from alligator.log.config import ConditionalLogger as ConditionalLogger
-from alligator.log.config import LogLevel as LogLevel
-from alligator.log.config import SilentLogger as SilentLogger
-from alligator.log.config import disable_logging as disable_logging
-from alligator.log.config import enable_logging as enable_logging
-from alligator.log.config import get_logger as get_logger
-from alligator.log.config import logger as logger
-from alligator.log.config import setup_logging as setup_logging
+from alligator.log.config import (
+    LogLevel,
+    disable_logging,
+    enable_logging,
+    get_logger,
+    logger,
+    refresh_logging,
+    setup_logging,
+)
 
 __all__ = [
     "setup_logging",
@@ -14,6 +15,5 @@ __all__ = [
     "disable_logging",
     "enable_logging",
     "LogLevel",
-    "SilentLogger",
-    "ConditionalLogger",
+    "refresh_logging",
 ]

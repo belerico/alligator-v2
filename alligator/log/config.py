@@ -1,8 +1,5 @@
 """
-Simple logging configuration for the Alligator entity linking system.
-
-This module provides a centralized logging setup with consistent formatting
-and appropriate log levels for different components.
+Simplified logging configuration for the Alligator entity linking system.
 """
 
 import logging
@@ -22,179 +19,98 @@ class LogLevel(IntEnum):
     CRITICAL = logging.CRITICAL
 
 
-class ConditionalLogger(logging.Logger):
-    """A logger subclass that respects user-configurable minimum log level."""
-
-    def __init__(self, name: str):
-        super().__init__(name)
-        self._user_min_level = self._get_user_min_level()
-
-        # Inherit configuration from root logger if it has handlers
-        root_logger = logging.getLogger()
-        if root_logger.handlers and not self.handlers:
-            # Copy handlers from root logger
-            for handler in root_logger.handlers:
-                self.addHandler(handler)
-            # Set the logger level to match the root logger's level
-            if root_logger.level != logging.NOTSET:
-                self.setLevel(root_logger.level)
-
-    def _get_user_min_level(self) -> int:
-        """Get the minimum log level from environment variable."""
-        level_str = os.environ.get("ALLIGATOR_MIN_LOG_LEVEL", "INFO").upper()
-        try:
-            return getattr(LogLevel, level_str).value
-        except AttributeError:
-            return LogLevel.INFO.value
-
-    def _log(self, level, msg, args, **kwargs):
-        """Override the internal _log method to implement level filtering."""
-        if level >= self._user_min_level:
-            super()._log(level, msg, args, **kwargs)
-
-    def log(self, level, msg, *args, **kwargs):
-        """Log with explicit level (supports both int and LogLevel enum)."""
-        if isinstance(level, LogLevel):
-            level = level.value
-        if level >= self._user_min_level:
-            super().log(level, msg, *args, **kwargs)
-
-    def debug(self, msg, *args, **kwargs):
-        """Log a debug message."""
-        if LogLevel.DEBUG >= self._user_min_level:
-            super().debug(msg, *args, **kwargs)
-
-    def info(self, msg, *args, **kwargs):
-        """Log an info message."""
-        if LogLevel.INFO >= self._user_min_level:
-            super().info(msg, *args, **kwargs)
-
-    def warning(self, msg, *args, **kwargs):
-        """Log a warning message."""
-        if LogLevel.WARNING >= self._user_min_level:
-            super().warning(msg, *args, **kwargs)
-
-    def error(self, msg, *args, **kwargs):
-        """Log an error message."""
-        if LogLevel.ERROR >= self._user_min_level:
-            super().error(msg, *args, **kwargs)
-
-    def critical(self, msg, *args, **kwargs):
-        """Log a critical message."""
-        if LogLevel.CRITICAL >= self._user_min_level:
-            super().critical(msg, *args, **kwargs)
-
-    def exception(self, msg, *args, exc_info=True, **kwargs):
-        """Log an exception message."""
-        if LogLevel.ERROR >= self._user_min_level:
-            super().exception(msg, *args, exc_info=exc_info, **kwargs)
-
-    def __getstate__(self):
-        """Support for pickling."""
-        return {"name": self.name}
-
-    def __setstate__(self, state):
-        """Support for unpickling."""
-        self.__init__(state["name"])
-
-    def __reduce__(self):
-        """Support for multiprocessing pickling."""
-        return (ConditionalLogger, (self.name,))
+def _get_env_log_level() -> int:
+    """Get log level from environment variable."""
+    level_str = os.environ.get("ALLIGATOR_MIN_LOG_LEVEL", "INFO").upper()
+    try:
+        return getattr(LogLevel, level_str).value
+    except AttributeError:
+        return LogLevel.INFO.value
 
 
-class SilentLogger(logging.Logger):
-    """A completely silent logger that does nothing."""
-
-    def __init__(self, name: str = "silent"):
-        super().__init__(name)
-        self.setLevel(logging.CRITICAL + 1)
-
-    def debug(self, *args, **kwargs):
-        pass
-
-    def info(self, *args, **kwargs):
-        pass
-
-    def warning(self, *args, **kwargs):
-        pass
-
-    def error(self, *args, **kwargs):
-        pass
-
-    def critical(self, *args, **kwargs):
-        pass
-
-    def log(self, *args, **kwargs):
-        pass
-
-    def exception(self, *args, **kwargs):
-        pass
-
-    def __getstate__(self):
-        """Support for pickling."""
-        return {"name": self.name}
-
-    def __setstate__(self, state):
-        """Support for unpickling."""
-        self.__init__(state["name"])
-
-    def __reduce__(self):
-        """Support for multiprocessing pickling."""
-        return (SilentLogger, (self.name,))
+def _is_logging_disabled() -> bool:
+    """Check if logging is disabled via environment variable."""
+    return os.environ.get("ALLIGATOR_DISABLE_LOGGING", "0") == "1"
 
 
 def setup_logging(
-    level: str = "INFO",
+    level: Optional[str] = None,
     format_string: Optional[str] = None,
     include_timestamp: bool = True,
-    disable_logging: bool = False,
 ) -> logging.Logger:
     """
     Set up logging configuration for the Alligator system.
 
     Args:
-        level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        level: Logging level override (if None, uses environment variable)
         format_string: Custom format string for log messages
         include_timestamp: Whether to include timestamp in log messages
-        disable_logging: Completely disable all logging
 
     Returns:
-        Configured logger instance
+        Root logger for Alligator
     """
 
-    # Set environment variable to communicate disabled state to worker processes
-    if disable_logging:
-        os.environ["ALLIGATOR_DISABLE_LOGGING"] = "1"
-        logging.disable(logging.CRITICAL)  # Disable all logging
-        return SilentLogger("alligator")
+    # Check if logging should be disabled
+    if _is_logging_disabled():
+        logging.disable(logging.CRITICAL)
+        return logging.getLogger("alligator")
     else:
-        os.environ.pop("ALLIGATOR_DISABLE_LOGGING", None)
-        logging.disable(logging.NOTSET)  # Re-enable logging
+        logging.disable(logging.NOTSET)  # Ensure logging is enabled
 
-    # Convert string level to logging constant
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    # Determine log level for Alligator
+    if level is not None:
+        alligator_level = getattr(logging, level.upper(), logging.INFO)
+    else:
+        alligator_level = _get_env_log_level()
 
-    # Default format string with [Time - module - level] format
+    # Default format string
     if format_string is None:
         if include_timestamp:
             format_string = "[%(asctime)s - %(name)s - %(levelname)s] %(message)s"
         else:
             format_string = "[%(name)s - %(levelname)s] %(message)s"
 
-    # Configure logging
+    # Configure root logger to WARNING (only errors from third-party libs)
     logging.basicConfig(
-        level=numeric_level,
+        level=logging.WARNING,  # Root logger at WARNING level
         format=format_string,
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
         force=True,  # Override any existing configuration
     )
 
-    # Return the root logger for Alligator
-    return get_logger("alligator")
+    # Set Alligator logger to the desired level
+    alligator_logger = logging.getLogger("alligator")
+    alligator_logger.setLevel(alligator_level)
+
+    # Suppress ALL third-party loggers automatically
+    _suppress_all_third_party_loggers()
+
+    return alligator_logger
 
 
-def get_logger(name: str):
+def _suppress_all_third_party_loggers():
+    """Automatically suppress ALL third-party loggers to WARNING level."""
+    # Get all existing loggers from the logging manager
+    for logger_name in logging.Logger.manager.loggerDict:
+        if not logger_name.startswith("alligator"):
+            # Set all non-alligator loggers to WARNING to reduce noise
+            logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+
+    # Also set a custom filter to catch new loggers created after this
+    class ThirdPartyLoggerFilter(logging.Filter):
+        def filter(self, record):
+            # Allow all alligator logs through
+            if record.name.startswith("alligator"):
+                return True
+            return False
+
+    # Add the filter to the root logger's handlers
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(ThirdPartyLoggerFilter())
+
+
+def get_logger(name: str) -> logging.Logger:
     """
     Get a logger for a specific component.
 
@@ -202,16 +118,30 @@ def get_logger(name: str):
         name: Name of the component (e.g., 'coordinator', 'data_manager')
 
     Returns:
-        ConditionalLogger instance for the component (or SilentLogger if disabled)
+        Logger instance for the component
     """
-    # Check if logging is disabled via environment variable (for worker processes)
-    if os.environ.get("ALLIGATOR_DISABLE_LOGGING") == "1":
-        # Ensure logging is disabled in this process too
-        logging.disable(logging.CRITICAL)
-        return SilentLogger(f"alligator.{name}")
+    logger = logging.getLogger(f"alligator.{name}")
 
-    # Return a ConditionalLogger instance
-    return ConditionalLogger(f"alligator.{name}")
+    # Apply current environment settings
+    refresh_logging()
+
+    return logger
+
+
+def refresh_logging():
+    """
+    Refresh logging configuration based on current environment variables.
+    Call this after changing environment variables to apply changes.
+    """
+    if _is_logging_disabled():
+        logging.disable(logging.CRITICAL)
+    else:
+        logging.disable(logging.NOTSET)
+        # Update log level for Alligator loggers only
+        new_level = _get_env_log_level()
+        logging.getLogger("alligator").setLevel(new_level)
+        # Automatically suppress all third-party loggers
+        _suppress_all_third_party_loggers()
 
 
 def disable_logging():
@@ -226,10 +156,5 @@ def enable_logging():
     logging.disable(logging.NOTSET)
 
 
-# Initialize default logging setup
-# Check if logging should be disabled at import time (for worker processes)
-if os.environ.get("ALLIGATOR_DISABLE_LOGGING") == "1":
-    logging.disable(logging.CRITICAL)
-    logger = SilentLogger("alligator")
-else:
-    logger = setup_logging()
+# Initialize logging on import
+logger = setup_logging()
