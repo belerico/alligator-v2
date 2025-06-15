@@ -238,7 +238,7 @@ class MLWorker(DatabaseAccessMixin):
                         {
                             k: v
                             for k, v in cand.items()
-                            if k in {"score", "id", "name", "description", "types"}
+                            if k in {"score", "id", "name", "description", "types", "llm_chosen"}
                         }
                         for cand in cands_to_save
                     ]

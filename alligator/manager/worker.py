@@ -92,6 +92,12 @@ class WorkerManager(DatabaseAccessMixin):
             db_name=db_name,
             mongo_uri=mongo_uri,
             input_collection=self.config.database.input_collection,
+            enable_llm_filtering=self.config.llm.enable_llm_filtering,
+            llm_model=self.config.llm.llm_model,
+            openrouter_api_key=self.config.llm.openrouter_api_key,
+            openrouter_api_url=self.config.llm.openrouter_api_url,
+            llm_top_k=self.config.llm.llm_top_k,
+            llm_cache_size=self.config.llm.llm_cache_size,
         )
 
         return candidate_fetcher, object_fetcher, literal_fetcher, row_processor

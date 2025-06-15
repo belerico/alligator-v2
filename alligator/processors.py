@@ -1,8 +1,12 @@
+import hashlib
+import os
+import re
 import traceback
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Set, Union
+from typing import Any, Dict, List, Mapping, Optional, Set, Union
 
 import pandas as pd
+from openai import AsyncOpenAI
 from pymongo import UpdateOne
 
 from alligator.database import DatabaseAccessMixin
@@ -31,6 +35,12 @@ class RowBatchProcessor(DatabaseAccessMixin):
         max_candidates_in_result: int = 5,
         fuzzy_retry: bool = False,
         column_types: Mapping[str, Union[str, List[str]]] | None = None,
+        enable_llm_filtering: bool = False,
+        llm_model: str = "anthropic/claude-3.5-sonnet",
+        openrouter_api_key: Optional[str] = None,
+        openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions",
+        llm_top_k: int = 5,
+        llm_cache_size: int = 1000,
         **kwargs,
     ):
         self.dataset_name = dataset_name
@@ -41,6 +51,15 @@ class RowBatchProcessor(DatabaseAccessMixin):
         self.literal_fetcher = literal_fetcher
         self.max_candidates_in_result = max_candidates_in_result
         self.fuzzy_retry = fuzzy_retry
+
+        # LLM filtering configuration
+        self.enable_llm_filtering = enable_llm_filtering
+        self.llm_model = llm_model
+        self._openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self._openrouter_api_url = openrouter_api_url
+        self.llm_top_k = llm_top_k
+        self.llm_cache_size = llm_cache_size
+
         # Process column_types to ensure they are all lists
         self.column_types = {}
         if column_types:
@@ -57,6 +76,24 @@ class RowBatchProcessor(DatabaseAccessMixin):
         self.candidate_collection = kwargs.get("candidate_collection", "candidates")
         self.mongo_wrapper = MongoWrapper(self._mongo_uri, self._db_name)
         self.logger = get_logger("processors")
+
+        # Initialize LLM filter if enabled
+        self.llm_filter = None
+        if self.enable_llm_filtering and self._openrouter_api_key:
+            try:
+                self.llm_filter = LLMCandidateFilter(
+                    api_key=self._openrouter_api_key,
+                    api_url=self._openrouter_api_url,
+                    model=self.llm_model,
+                    top_k=self.llm_top_k,
+                    cache_size=self.llm_cache_size,
+                )
+                self.logger.info("LLM candidate filtering enabled")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize LLM filter: {e}")
+                self.llm_filter = None
+        elif self.enable_llm_filtering and not self._openrouter_api_key:
+            self.logger.warning("LLM filtering enabled but no OpenRouter API key provided")
 
     async def process_rows_batch(self, docs):
         """
@@ -239,12 +276,11 @@ class RowBatchProcessor(DatabaseAccessMixin):
                         if cand.id:
                             entity_ids.add(cand.id)
 
-                # Filter candidates with llm
-                if self.feature.enable_llm_filtering and mention_candidates:
-                    mention_candidates = self.feature.filter_candidates_with_llm(
+                # Apply LLM filtering and marking if enabled
+                if self.llm_filter and mention_candidates:
+                    await self.llm_filter.filter_and_mark_candidates(
                         cell_value, mention_candidates, row_data.row
                     )
-                    candidates_by_col[normalized_col] = mention_candidates
 
                 # Process each entity in the row
                 self._compute_features(row_str, mention_candidates, row_data.row)
@@ -324,3 +360,182 @@ class RowBatchProcessor(DatabaseAccessMixin):
             self.feature.compute_entity_literal_relationships(
                 candidates_by_col, row_data.lit_columns, row_data.row, literals_data
             )
+
+
+class LLMCandidateFilter:
+    """
+    Async LLM-based candidate filtering with caching.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        api_url: str = "https://openrouter.ai/api/v1/chat/completions",
+        model: str = "anthropic/claude-3.5-sonnet",
+        top_k: int = 5,
+        cache_size: int = 1000,
+    ):
+        self.client = AsyncOpenAI(
+            api_key=api_key, base_url=api_url.replace("/chat/completions", "")
+        )
+        self.model = model
+        self.top_k = top_k
+        self.logger = get_logger("llm_filter")
+
+        # Simple in-memory cache with LRU-like behavior
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_size = cache_size
+        self._cache_order: List[str] = []
+
+    def _generate_cache_key(
+        self, mention: str, candidates: List[Candidate], context: List[Any]
+    ) -> str:
+        """Generate a cache key for the LLM request."""
+        # Create a deterministic key based on mention, candidate IDs, and context
+        candidate_ids = sorted([c.id for c in candidates])
+        context_str = "|".join([str(x) for x in context if x])
+        key_data = f"{mention}:{':'.join(candidate_ids)}:{context_str}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+
+    def _get_from_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Get result from cache."""
+        if cache_key in self._cache:
+            # Move to end (most recently used)
+            self._cache_order.remove(cache_key)
+            self._cache_order.append(cache_key)
+            return self._cache[cache_key]
+        return None
+
+    def _put_in_cache(self, cache_key: str, result: Dict[str, Any]) -> None:
+        """Put result in cache with LRU eviction."""
+        if len(self._cache) >= self._cache_size:
+            # Remove least recently used
+            oldest_key = self._cache_order.pop(0)
+            del self._cache[oldest_key]
+
+        self._cache[cache_key] = result
+        self._cache_order.append(cache_key)
+
+    async def filter_and_mark_candidates(
+        self, mention: str, candidates: List[Candidate], row_context: List[Any]
+    ) -> List[Candidate]:
+        """
+        Filter candidates using LLM and mark top-k as llm_chosen.
+
+        Args:
+            mention: The text mention from the table cell
+            candidates: List of candidate entities (modified in-place)
+            row_context: The complete row data for context
+
+        Returns:
+            All candidates with llm_chosen field updated for top-k
+        """
+        if not candidates:
+            return candidates
+
+        if len(candidates) <= 1:
+            # Single candidate - mark as chosen
+            candidates[0].llm_chosen = True
+            return candidates
+
+        try:
+            # Check cache first
+            cache_key = self._generate_cache_key(mention, candidates, row_context)
+            cached_result = self._get_from_cache(cache_key)
+
+            if cached_result:
+                self.logger.debug(f"Using cached LLM result for mention '{mention}'")
+                chosen_indices = cached_result["chosen_indices"]
+            else:
+                # Make async LLM call
+                chosen_indices = await self._call_llm(mention, candidates, row_context)
+
+                # Cache the result
+                self._put_in_cache(cache_key, {"chosen_indices": chosen_indices})
+
+            # Mark chosen candidates
+            for i, candidate in enumerate(candidates):
+                candidate.llm_chosen = i in chosen_indices
+
+            self.logger.debug(
+                f"LLM marked {len(chosen_indices)}/{len(candidates)} candidates "
+                f"as chosen for mention '{mention}'"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in LLM candidate filtering: {e}")
+            # Conservative fallback - mark top candidates by score as chosen
+            sorted_candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
+            top_candidates = sorted_candidates[: self.top_k]
+            for candidate in candidates:
+                candidate.llm_chosen = candidate in top_candidates
+
+        return candidates
+
+    async def _call_llm(
+        self, mention: str, candidates: List[Candidate], row_context: List[Any]
+    ) -> List[int]:
+        """Make async LLM API call to select top-k candidates."""
+        context_str = " | ".join([str(cell) for cell in row_context if cell])
+
+        # Format candidates for the prompt
+        candidate_info = []
+        for i, candidate in enumerate(candidates):
+            types_str = ", ".join([t.get("name", t.get("id", "")) for t in candidate.types[:3]])
+            candidate_info.append(
+                f"{i+1}. {candidate.name} ({candidate.id})"
+                + (f" - Types: {types_str}" if types_str else "")
+                + (f" - {candidate.description[:100]}..." if candidate.description else "")
+            )
+
+        candidates_text = "\n".join(candidate_info)
+
+        prompt = f"""Given this table row context: {context_str}
+
+        For the mention "{mention}", select the TOP {self.top_k} most plausible candidates from the list below.
+        Consider the table context to identify the most relevant matches.
+
+        Candidates:
+        {candidates_text}
+
+        Return only the numbers (1, 2, 3, etc.) of the TOP {self.top_k} most plausible candidates, separated by commas.
+        Order them by plausibility (most plausible first).
+        If there are fewer than {self.top_k} plausible candidates, return only the plausible ones."""  # noqa: E501
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.1,
+                timeout=30,
+            )
+
+            content = response.choices[0].message.content or ""
+            numbers = [int(x) for x in re.findall(r"\b\d+\b", content)]
+
+            # Convert to 0-based indices and limit to top_k
+            chosen_indices = []
+            for num in numbers[: self.top_k]:
+                if 1 <= num <= len(candidates):
+                    chosen_indices.append(num - 1)
+
+            # If no valid candidates were selected, fallback to top candidates by score
+            if not chosen_indices:
+                self.logger.warning(
+                    f"LLM returned no valid candidates for mention '{mention}', using score fallback"  # noqa: E501
+                )
+                sorted_indices = sorted(
+                    range(len(candidates)), key=lambda i: candidates[i].score, reverse=True
+                )
+                chosen_indices = sorted_indices[: self.top_k]
+
+            return chosen_indices
+
+        except Exception as e:
+            self.logger.error(f"LLM API call failed: {e}")
+            # Fallback to top candidates by score
+            sorted_indices = sorted(
+                range(len(candidates)), key=lambda i: candidates[i].score, reverse=True
+            )
+            return sorted_indices[: self.top_k]

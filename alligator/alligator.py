@@ -126,10 +126,10 @@ class Alligator:
         self.num_ml_workers = self.config.ml.num_ml_workers
         self.top_n_cta_cpa_freq = self.config.feature.top_n_cta_cpa_freq
         self.doc_percentage_type_features = self.config.feature.doc_percentage_type_features
-        self.enable_llm_filtering = self.config.feature.enable_llm_filtering
-        self.llm_model = self.config.feature.llm_model
-        self.openrouter_api_key = self.config.feature.openrouter_api_key
-        self.openrouter_api_url = self.config.feature.openrouter_api_url
+        self.enable_llm_filtering = self.config.llm.enable_llm_filtering
+        self.llm_model = self.config.llm.llm_model
+        self.openrouter_api_key = self.config.llm.openrouter_api_key
+        self.openrouter_api_url = self.config.llm.openrouter_api_url
         self.correct_qids = self.config.data.correct_qids
 
         # Expose some internal properties for compatibility

@@ -208,16 +208,26 @@ class FeatureConfig:
 
     top_n_cta_cpa_freq: int = 3
     doc_percentage_type_features: float = 1.0
-    enable_llm_filtering: bool = False
-    llm_model: str = "anthropic/claude-3.5-sonnet"
-    openrouter_api_key: Optional[str] = None
-    openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
 
     def __post_init__(self):
         """Validate feature configuration."""
         if not (0 < self.doc_percentage_type_features <= 1):
             raise ValueError("doc_percentage_type_features must be between 0 and 1 (exclusive).")
 
+
+@dataclass
+class LLMConfig:
+    """Configuration for LLM-based candidate filtering."""
+
+    enable_llm_filtering: bool = False
+    llm_model: str = "anthropic/claude-3.5-sonnet"
+    llm_top_k: int = 5
+    llm_cache_size: int = 1000
+    openrouter_api_key: Optional[str] = None
+    openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __post_init__(self):
+        """Validate LLM configuration."""
         # Get OpenRouter API key from environment if not provided
         if self.openrouter_api_key is None:
             self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", None)
@@ -301,8 +311,11 @@ class AlligatorConfig:
         # Feature configuration
         top_n_cta_cpa_freq: int = 3,
         doc_percentage_type_features: float = 1.0,
+        # LLM configuration
         enable_llm_filtering: bool = False,
         llm_model: str = "anthropic/claude-3.5-sonnet",
+        llm_top_k: int = 5,
+        llm_cache_size: int = 1000,
         openrouter_api_key: Optional[str] = None,
         openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions",
         # Database configuration
@@ -355,8 +368,13 @@ class AlligatorConfig:
         self.feature = FeatureConfig(
             top_n_cta_cpa_freq=top_n_cta_cpa_freq,
             doc_percentage_type_features=doc_percentage_type_features,
+        )
+
+        self.llm = LLMConfig(
             enable_llm_filtering=enable_llm_filtering,
             llm_model=llm_model,
+            llm_top_k=llm_top_k,
+            llm_cache_size=llm_cache_size,
             openrouter_api_key=openrouter_api_key,
             openrouter_api_url=openrouter_api_url,
         )
@@ -373,7 +391,7 @@ class AlligatorConfig:
         """Convert configuration to dictionary format."""
         config_dict = {}
 
-        for section_name in ["data", "worker", "retrieval", "ml", "feature", "database"]:
+        for section_name in ["data", "worker", "retrieval", "ml", "feature", "llm", "database"]:
             section = getattr(self, section_name)
             if hasattr(section, "__dict__"):
                 config_dict[section_name] = section.__dict__.copy()
@@ -398,5 +416,6 @@ class AlligatorConfig:
             f"retrieval={self.retrieval}, "
             f"ml={self.ml}, "
             f"feature={self.feature}, "
+            f"llm={self.llm}, "
             f"database={self.database})"
         )
