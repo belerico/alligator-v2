@@ -204,6 +204,8 @@ class TestAlligator:
             mock_config_instance.worker = Mock()
             mock_config_instance.worker.worker_batch_size = 16
             mock_config_instance.worker.num_workers = 1
+            mock_config_instance.llm = Mock()
+            mock_config_instance.llm.enable_llm_filtering = False
 
             mock_config_class.return_value = mock_config_instance
             Alligator(

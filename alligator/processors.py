@@ -13,7 +13,7 @@ from alligator.database import DatabaseAccessMixin
 from alligator.feature import Feature
 from alligator.fetchers import CandidateFetcher, LiteralFetcher, ObjectFetcher
 from alligator.log import get_logger
-from alligator.mongo import MongoWrapper
+from alligator.mongo import MongoCache, MongoWrapper
 from alligator.types import Candidate, Entity, RowData
 from alligator.utils import ColumnHelper, clean_str
 
@@ -87,8 +87,10 @@ class RowBatchProcessor(DatabaseAccessMixin):
                     model=self.llm_model,
                     top_k=self.llm_top_k,
                     cache_size=self.llm_cache_size,
+                    mongo_uri=self._mongo_uri,
+                    db_name=self._db_name,
                 )
-                self.logger.info("LLM candidate filtering enabled")
+                self.logger.info("LLM candidate filtering enabled with MongoDB caching")
             except Exception as e:
                 self.logger.error(f"Failed to initialize LLM filter: {e}")
                 self.llm_filter = None
@@ -364,7 +366,7 @@ class RowBatchProcessor(DatabaseAccessMixin):
 
 class LLMCandidateFilter:
     """
-    Async LLM-based candidate filtering with caching.
+    Async LLM-based candidate filtering with MongoDB caching.
     """
 
     def __init__(
@@ -374,6 +376,9 @@ class LLMCandidateFilter:
         model: str = "anthropic/claude-3.5-sonnet",
         top_k: int = 5,
         cache_size: int = 1000,
+        mongo_uri: str = "mongodb://gator-mongodb:27017/",
+        db_name: str = "alligator_db",
+        cache_ttl_seconds: int = 86400,  # 24 hours
     ):
         self.client = AsyncOpenAI(
             api_key=api_key, base_url=api_url.replace("/chat/completions", "")
@@ -382,10 +387,15 @@ class LLMCandidateFilter:
         self.top_k = top_k
         self.logger = get_logger("llm_filter")
 
-        # Simple in-memory cache with LRU-like behavior
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._cache_size = cache_size
-        self._cache_order: List[str] = []
+        # Initialize MongoDB cache
+        self._cache = MongoCache(
+            mongo_uri=mongo_uri,
+            db_name=db_name,
+            collection_name="llm_candidate_cache",
+            ttl_seconds=cache_ttl_seconds,
+            capped_size_bytes=cache_size * 1024,  # Convert to bytes (approximate)
+            capped_max_docs=cache_size,
+        )
 
     def _generate_cache_key(
         self, mention: str, candidates: List[Candidate], context: List[Any]
@@ -399,22 +409,18 @@ class LLMCandidateFilter:
 
     def _get_from_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """Get result from cache."""
-        if cache_key in self._cache:
-            # Move to end (most recently used)
-            self._cache_order.remove(cache_key)
-            self._cache_order.append(cache_key)
-            return self._cache[cache_key]
-        return None
+        try:
+            return self._cache.get(cache_key)
+        except Exception as e:
+            self.logger.warning(f"Error reading from cache: {e}")
+            return None
 
     def _put_in_cache(self, cache_key: str, result: Dict[str, Any]) -> None:
-        """Put result in cache with LRU eviction."""
-        if len(self._cache) >= self._cache_size:
-            # Remove least recently used
-            oldest_key = self._cache_order.pop(0)
-            del self._cache[oldest_key]
-
-        self._cache[cache_key] = result
-        self._cache_order.append(cache_key)
+        """Put result in cache."""
+        try:
+            self._cache.put(cache_key, result)
+        except Exception as e:
+            self.logger.warning(f"Error writing to cache: {e}")
 
     async def filter_and_mark_candidates(
         self, mention: str, candidates: List[Candidate], row_context: List[Any]
@@ -485,7 +491,7 @@ class LLMCandidateFilter:
             candidate_info.append(
                 f"{i+1}. {candidate.name} ({candidate.id})"
                 + (f" - Types: {types_str}" if types_str else "")
-                + (f" - {candidate.description[:100]}..." if candidate.description else "")
+                + (f" - {candidate.description}" if candidate.description else "")
             )
 
         candidates_text = "\n".join(candidate_info)
