@@ -58,7 +58,7 @@ class Candidate:
     types: List[Dict[str, str]] = field(default_factory=list)
     predicates: Dict[str, Dict[str, float]] = field(default_factory=lambda: defaultdict(dict))
     matches: Dict[str, List[Dict[str, Any]]] = field(default_factory=lambda: defaultdict(list))
-    llm_chosen: bool = False  # New field to mark LLM-selected candidates
+    llm_chosen: int = -1
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage."""

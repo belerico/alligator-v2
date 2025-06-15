@@ -228,7 +228,22 @@ class MLWorker(DatabaseAccessMixin):
                 col_cands = candidates_by_column[col_id]
                 for c_idx, scr in cdict.items():
                     col_cands[c_idx]["score"] = scr
-                sorted_cands = sorted(col_cands, key=lambda x: x.get("score", 0.0), reverse=True)
+                    if self.stage == "rerank":
+                        if "llm_chosen" not in col_cands[c_idx]:
+                            position_delta = 0.0
+                        else:
+                            llm_chosen = col_cands[c_idx].get("llm_chosen", -1)
+                            if llm_chosen == -1:
+                                position_delta = 0.0
+                            else:
+                                position_delta = c_idx - llm_chosen
+                        # symlog scaling of the score based on position delta
+                        col_cands[c_idx]["llm_score"] = col_cands[c_idx]["score"] * (
+                            1 + np.sign(position_delta) * np.log(abs(position_delta) + 1)
+                        )
+                sorted_cands = sorted(
+                    col_cands, key=lambda x: x.get("llm_score", 0.0), reverse=True
+                )
                 if self.stage == "rerank":
                     if self.max_candidates_in_result > 0:
                         cands_to_save = sorted_cands[: self.max_candidates_in_result]
@@ -238,7 +253,16 @@ class MLWorker(DatabaseAccessMixin):
                         {
                             k: v
                             for k, v in cand.items()
-                            if k in {"score", "id", "name", "description", "types", "llm_chosen"}
+                            if k
+                            in {
+                                "score",
+                                "llm_score",
+                                "id",
+                                "name",
+                                "description",
+                                "types",
+                                "llm_chosen",
+                            }
                         }
                         for cand in cands_to_save
                     ]

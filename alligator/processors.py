@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import os
 import re
@@ -96,6 +97,7 @@ class RowBatchProcessor(DatabaseAccessMixin):
                 self.llm_filter = None
         elif self.enable_llm_filtering and not self._openrouter_api_key:
             self.logger.warning("LLM filtering enabled but no OpenRouter API key provided")
+            self.llm_filter = None
 
     async def process_rows_batch(self, docs):
         """
@@ -257,6 +259,9 @@ class RowBatchProcessor(DatabaseAccessMixin):
         bulk_input = []
         db = self.get_db()
 
+        # Collect all LLM filtering tasks across all rows
+        llm_tasks = []
+
         """Process each row and update database."""
         for row_data in row_data_list:
             entity_ids = set()
@@ -278,13 +283,28 @@ class RowBatchProcessor(DatabaseAccessMixin):
                         if cand.id:
                             entity_ids.add(cand.id)
 
-                # Apply LLM filtering and marking if enabled
+                # Collect LLM filtering tasks instead of processing individually
                 if self.llm_filter and mention_candidates:
-                    await self.llm_filter.filter_and_mark_candidates(
-                        cell_value, mention_candidates, row_data.row
-                    )
+                    llm_tasks.append((cell_value, mention_candidates, row_data.row))
 
-                # Process each entity in the row
+            # Store metadata for later processing
+            setattr(row_data, "_candidates_by_col", candidates_by_col)
+            setattr(row_data, "_entity_ids", entity_ids)
+            setattr(row_data, "_row_str", row_str)
+
+        # Process all LLM tasks in batch
+        if llm_tasks and self.llm_filter:
+            self.logger.debug(f"Processing {len(llm_tasks)} LLM filtering tasks in batch")
+            await self.llm_filter.filter_and_mark_candidates_batch(llm_tasks)
+
+        # Continue with feature computation and database updates
+        for row_data in row_data_list:
+            candidates_by_col = getattr(row_data, "_candidates_by_col", {})
+            entity_ids = getattr(row_data, "_entity_ids", set())
+            row_str = getattr(row_data, "_row_str", "")
+
+            # Process each entity in the row (compute features)
+            for col_id, mention_candidates in candidates_by_col.items():
                 self._compute_features(row_str, mention_candidates, row_data.row)
 
             # Enhance with additional features if possible
@@ -422,61 +442,123 @@ class LLMCandidateFilter:
         except Exception as e:
             self.logger.warning(f"Error writing to cache: {e}")
 
-    async def filter_and_mark_candidates(
-        self, mention: str, candidates: List[Candidate], row_context: List[Any]
-    ) -> List[Candidate]:
+    async def filter_and_mark_candidates_batch(
+        self, tasks: List[tuple[str, List[Candidate], List[Any]]]
+    ) -> List[List[Candidate]]:
         """
-        Filter candidates using LLM and mark top-k as llm_chosen.
+        Batch process multiple candidate filtering tasks concurrently.
 
         Args:
-            mention: The text mention from the table cell
-            candidates: List of candidate entities (modified in-place)
-            row_context: The complete row data for context
+            tasks: List of (mention, candidates, row_context) tuples
 
         Returns:
-            All candidates with llm_chosen field updated for top-k
+            List of updated candidate lists with llm_chosen fields set
         """
-        if not candidates:
-            return candidates
+        if not tasks:
+            return []
 
-        if len(candidates) <= 1:
-            # Single candidate - mark as chosen
-            candidates[0].llm_chosen = True
-            return candidates
+        # Separate cache checks and API calls
+        cache_results = []
+        api_tasks = []
+        api_task_indices = []
 
-        try:
-            # Check cache first
+        for i, (mention, candidates, row_context) in enumerate(tasks):
+            if not candidates:
+                cache_results.append(candidates)
+                continue
+
+            if len(candidates) <= 1:
+                # Single candidate - mark as chosen
+                candidates[0].llm_chosen = 0
+                cache_results.append(candidates)
+                continue
+
+            # Check cache
             cache_key = self._generate_cache_key(mention, candidates, row_context)
             cached_result = self._get_from_cache(cache_key)
 
             if cached_result:
+                # Cache hit - mark candidates and add to results
                 self.logger.debug(f"Using cached LLM result for mention '{mention}'")
                 chosen_indices = cached_result["chosen_indices"]
+                for j, candidate in enumerate(candidates):
+                    if j in chosen_indices:
+                        candidate.llm_chosen = chosen_indices.index(j)
+                    else:
+                        candidate.llm_chosen = -1
+                cache_results.append(candidates)
             else:
-                # Make async LLM call
-                chosen_indices = await self._call_llm(mention, candidates, row_context)
+                # Cache miss - prepare for API call
+                cache_results.append(None)  # Placeholder
+                api_tasks.append((mention, candidates, row_context, cache_key))
+                api_task_indices.append(i)
 
-                # Cache the result
-                self._put_in_cache(cache_key, {"chosen_indices": chosen_indices})
+        # Make concurrent API calls for cache misses
+        if api_tasks:
+            self.logger.debug(f"Making {len(api_tasks)} concurrent LLM API calls")
 
-            # Mark chosen candidates
-            for i, candidate in enumerate(candidates):
-                candidate.llm_chosen = i in chosen_indices
+            # Create coroutines for concurrent execution
+            api_coroutines = [
+                self._call_llm_and_cache(mention, candidates, row_context, cache_key)
+                for mention, candidates, row_context, cache_key in api_tasks
+            ]
 
-            self.logger.debug(
-                f"LLM marked {len(chosen_indices)}/{len(candidates)} candidates "
-                f"as chosen for mention '{mention}'"
-            )
+            # Execute all API calls concurrently
+            try:
+                api_results = await asyncio.gather(*api_coroutines, return_exceptions=True)
 
+                # Process results and update candidates
+                for api_idx, (task_idx, result) in enumerate(zip(api_task_indices, api_results)):
+                    mention, candidates, row_context, cache_key = api_tasks[api_idx]
+
+                    chosen_indices: List[int]
+                    if isinstance(result, Exception):
+                        self.logger.error(f"LLM API call failed for '{mention}': {result}")
+                        chosen_indices = []
+                    else:
+                        chosen_indices = result  # type: ignore
+
+                    # Mark candidates
+                    for j, candidate in enumerate(candidates):
+                        if j in chosen_indices:
+                            candidate.llm_chosen = chosen_indices.index(j)
+                        else:
+                            candidate.llm_chosen = -1
+
+                    cache_results[task_idx] = candidates
+
+            except Exception as e:
+                self.logger.error(f"Batch LLM processing failed: {e}")
+                for task_idx in api_task_indices:
+                    mention, candidates, row_context, cache_key = api_tasks[
+                        api_task_indices.index(task_idx)
+                    ]
+                    chosen_indices = []
+                    for j, candidate in enumerate(candidates):
+                        if j in chosen_indices:
+                            candidate.llm_chosen = chosen_indices.index(j)
+                        else:
+                            candidate.llm_chosen = -1
+                    cache_results[task_idx] = candidates
+
+        return cache_results
+
+    async def _call_llm_and_cache(
+        self, mention: str, candidates: List[Candidate], row_context: List[Any], cache_key: str
+    ) -> List[int]:
+        """
+        Make LLM API call and cache the result.
+
+        Returns:
+            List of chosen candidate indices
+        """
+        try:
+            chosen_indices = await self._call_llm(mention, candidates, row_context)
+            self._put_in_cache(cache_key, {"chosen_indices": chosen_indices})
+            return chosen_indices
         except Exception as e:
-            self.logger.error(f"Error in LLM candidate filtering: {e}")
-            # Conservative fallback - mark top candidates by score as chosen
-            sorted_candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
-            top_candidates = sorted_candidates[: self.top_k]
-            for candidate in candidates:
-                candidate.llm_chosen = candidate in top_candidates
-
-        return candidates
+            self.logger.error(f"LLM API call failed for '{mention}': {e}")
+            return []
 
     async def _call_llm(
         self, mention: str, candidates: List[Candidate], row_context: List[Any]
@@ -520,28 +602,19 @@ class LLMCandidateFilter:
             content = response.choices[0].message.content or ""
             numbers = [int(x) for x in re.findall(r"\b\d+\b", content)]
 
-            # Convert to 0-based indices and limit to top_k
             chosen_indices = []
             for num in numbers[: self.top_k]:
                 if 1 <= num <= len(candidates):
                     chosen_indices.append(num - 1)
 
-            # If no valid candidates were selected, fallback to top candidates by score
             if not chosen_indices:
                 self.logger.warning(
-                    f"LLM returned no valid candidates for mention '{mention}', using score fallback"  # noqa: E501
+                    f"LLM returned no valid candidates for mention '{mention}', using fallback"  # noqa: E501
                 )
-                sorted_indices = sorted(
-                    range(len(candidates)), key=lambda i: candidates[i].score, reverse=True
-                )
-                chosen_indices = sorted_indices[: self.top_k]
+                chosen_indices = []
 
             return chosen_indices
 
         except Exception as e:
             self.logger.error(f"LLM API call failed: {e}")
-            # Fallback to top candidates by score
-            sorted_indices = sorted(
-                range(len(candidates)), key=lambda i: candidates[i].score, reverse=True
-            )
-            return sorted_indices[: self.top_k]
+            return []
