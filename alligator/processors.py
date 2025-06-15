@@ -222,7 +222,7 @@ class RowBatchProcessor(DatabaseAccessMixin):
         for row_data in row_data_list:
             entity_ids = set()
             candidates_by_col = {}
-            row_value = " ".join(str(v) for v in row_data.row)
+            row_str = " ".join(str(v) for v in row_data.row)
             for col_idx, ner_type in row_data.ne_columns.items():
                 normalized_col = ColumnHelper.normalize(col_idx)
                 if not ColumnHelper.is_valid_index(normalized_col, len(row_data.row)):
@@ -239,8 +239,15 @@ class RowBatchProcessor(DatabaseAccessMixin):
                         if cand.id:
                             entity_ids.add(cand.id)
 
+                # Filter candidates with llm
+                if self.feature.enable_llm_filtering and mention_candidates:
+                    mention_candidates = self.feature.filter_candidates_with_llm(
+                        cell_value, mention_candidates, row_data.row
+                    )
+                    candidates_by_col[normalized_col] = mention_candidates
+
                 # Process each entity in the row
-                self._compute_features(row_value, mention_candidates)
+                self._compute_features(row_str, mention_candidates, row_data.row)
 
             # Enhance with additional features if possible
             if self.object_fetcher and self.literal_fetcher:
@@ -287,11 +294,11 @@ class RowBatchProcessor(DatabaseAccessMixin):
                     bulk_input[i : i + bulk_batch_size], ordered=False
                 )
 
-    def _compute_features(self, row_value: str, candidates: List[Candidate]):
+    def _compute_features(self, row_str: str, candidates: List[Candidate], row: List[str]):
         """Process entities by computing features. Feature computation
         is done in-place over the candidates."""
 
-        self.feature.process_candidates(candidates, row_value)
+        self.feature.process_candidates(candidates, row_str, row)
 
     async def _enhance_with_lamapi_features(
         self,

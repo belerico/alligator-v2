@@ -53,6 +53,10 @@ class Alligator:
         num_ml_workers: int = 2,
         top_n_cta_cpa_freq: int = 3,
         doc_percentage_type_features: float = 1.0,
+        enable_llm_filtering: bool = False,
+        llm_model: str = "anthropic/claude-3.5-sonnet",
+        openrouter_api_key: str | None = None,
+        openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions",
         save_output: bool = True,
         save_output_to_csv: bool = True,
         correct_qids: Dict[str, str | List[str]] | None = None,
@@ -86,6 +90,10 @@ class Alligator:
             num_ml_workers=num_ml_workers,
             top_n_cta_cpa_freq=top_n_cta_cpa_freq,
             doc_percentage_type_features=doc_percentage_type_features,
+            enable_llm_filtering=enable_llm_filtering,
+            llm_model=llm_model,
+            openrouter_api_key=openrouter_api_key,
+            openrouter_api_url=openrouter_api_url,
             save_output=save_output,
             save_output_to_csv=save_output_to_csv,
             correct_qids=correct_qids,
@@ -118,6 +126,10 @@ class Alligator:
         self.num_ml_workers = self.config.ml.num_ml_workers
         self.top_n_cta_cpa_freq = self.config.feature.top_n_cta_cpa_freq
         self.doc_percentage_type_features = self.config.feature.doc_percentage_type_features
+        self.enable_llm_filtering = self.config.feature.enable_llm_filtering
+        self.llm_model = self.config.feature.llm_model
+        self.openrouter_api_key = self.config.feature.openrouter_api_key
+        self.openrouter_api_url = self.config.feature.openrouter_api_url
         self.correct_qids = self.config.data.correct_qids
 
         # Expose some internal properties for compatibility

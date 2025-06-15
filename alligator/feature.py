@@ -1,7 +1,9 @@
+import os
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 from alligator.database import DatabaseAccessMixin
 from alligator.log import get_logger
@@ -55,6 +57,10 @@ class Feature(DatabaseAccessMixin):
         table_name: str,
         top_n_cta_cpa_freq: int = 3,
         features: Optional[List[str]] = None,
+        enable_llm_filtering: bool = False,
+        llm_model: str = "anthropic/claude-3.5-sonnet",
+        openrouter_api_key: Optional[str] = None,
+        openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions",
         **kwargs,
     ):
         self.dataset_name = dataset_name
@@ -68,9 +74,24 @@ class Feature(DatabaseAccessMixin):
         self.candidate_collection = kwargs.get("candidate_collection", "candidates")
         self._predicate_frequencies = None
 
-    def process_candidates(self, candidates: List[Candidate], row: Optional[str]) -> None:
+        # LLM filtering configuration
+        self.enable_llm_filtering = enable_llm_filtering
+        self.llm_model = llm_model
+        self._openrouter_api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self._openrouter_api_url = openrouter_api_url
+
+    def process_candidates(
+        self,
+        candidates: List[Candidate],
+        row: Optional[str],
+        row_context: Optional[List[Any]] = None,
+    ) -> List[Candidate]:
         """
         Process candidate records to calculate a set of features for each candidate.
+        Optionally filter candidates using LLM if enabled.
+
+        Returns:
+            List of processed (and potentially filtered) candidates
         """
         # Use a safe version of entity_name for computations.
         safe_row = row if row is not None else ""
@@ -109,6 +130,8 @@ class Feature(DatabaseAccessMixin):
 
             # Preserve the original candidate values, even if they are None
             candidate.features = features
+
+        return candidates
 
     def compute_global_frequencies(
         self, docs_to_process: float = 1.0, random_sample: bool = False
@@ -454,3 +477,135 @@ class Feature(DatabaseAccessMixin):
 
                     # Normalize and update feature
                     subj_candidate.features["p_subj_lit_datatype"] += max_score / n_lit_cols
+
+    def filter_candidates_with_llm(
+        self,
+        mention: str,
+        candidates: List[Candidate],
+        row_context: List[Any],
+    ) -> List[Candidate]:
+        """
+        Filter candidates using OpenRouter.ai LLM based on mention and row context.
+
+        Args:
+            mention: The text mention from the table cell
+            candidates: List of candidate entities
+            row_context: The complete row data for context
+
+        Returns:
+            Filtered list of candidates
+        """
+        if not self.enable_llm_filtering or not self._openrouter_api_key or not candidates:
+            return candidates
+
+        if len(candidates) <= 1:
+            return candidates  # No need to filter single candidate
+
+        try:
+            # Prepare context
+            context_str = " | ".join([str(cell) for cell in row_context if cell])
+
+            # Format candidates for the prompt
+            candidate_info = []
+            for i, candidate in enumerate(candidates):
+                types_str = ", ".join(
+                    [t.get("name", t.get("id", "")) for t in candidate.types[:3]]
+                )
+                candidate_info.append(
+                    f"{i+1}. {candidate.name} ({candidate.id})"
+                    + (f" - Types: {types_str}" if types_str else "")
+                    + (f" - {candidate.description[:100]}..." if candidate.description else "")
+                )
+
+            candidates_text = "\n".join(candidate_info)
+
+            prompt = f"""Given this table row context: {context_str}
+            For the mention "{mention}", which of these candidates are plausible matches?
+            Candidates:
+            {candidates_text}
+            Return only the numbers (1, 2, 3, etc.) of plausible candidates, separated by commas.
+            Consider the table context to eliminate clearly wrong matches.
+            If unsure, be conservative and include the candidate.
+            """
+
+            headers = {
+                "Authorization": f"Bearer {self._openrouter_api_key}",
+                "Content-Type": "application/json",
+            }
+
+            data = {
+                "model": self.llm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0.1,
+            }
+
+            response = requests.post(
+                url=self._openrouter_api_url or "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+                # Parse the response to get candidate indices
+                try:
+                    # Extract numbers from response
+                    import re
+
+                    numbers = [int(x) for x in re.findall(r"\b\d+\b", content)]
+
+                    # Filter candidates based on LLM response
+                    filtered_candidates = []
+                    for num in numbers:
+                        if 1 <= num <= len(candidates):
+                            filtered_candidates.append(candidates[num - 1])
+
+                    # If no valid candidates were selected, return all (conservative approach)
+                    if not filtered_candidates:
+                        self.logger.warning(
+                            "LLM filtering returned no valid candidates "
+                            f"for mention '{mention}', keeping all"
+                        )
+                        return candidates
+
+                    self.logger.debug(
+                        f"LLM filtered {len(candidates)} candidates to "
+                        f"{len(filtered_candidates)} for mention '{mention}'"
+                    )
+                    return filtered_candidates
+
+                except (ValueError, IndexError) as e:
+                    self.logger.warning(
+                        f"Failed to parse LLM response for mention '{mention}': {e}"
+                    )
+                    return candidates
+
+            else:
+                self.logger.warning(
+                    f"OpenRouter API request failed with status {response.status_code}"
+                )
+                return candidates
+
+        except Exception as e:
+            self.logger.error(f"Error in LLM candidate filtering: {e}")
+            return candidates  # Return all candidates if filtering fails
+
+    def set_llm_filtering(self, enabled: bool, model: str = "anthropic/claude-3.5-sonnet") -> None:
+        """
+        Enable or disable LLM-based candidate filtering.
+
+        Args:
+            enabled: Whether to enable LLM filtering
+            model: OpenRouter model to use (default: claude-3.5-sonnet)
+        """
+        self.enable_llm_filtering = enabled
+        self.llm_model = model
+
+        if enabled and not self._openrouter_api_key:
+            self.logger.warning(
+                "LLM filtering enabled but OPENROUTER_API_KEY not found in environment variables"
+            )
